@@ -21,6 +21,26 @@ graph LR
 
 ---
 
+### 🤖 Install via AI Agent
+
+Send this to your AI agent:
+
+> Read https://raw.githubusercontent.com/grunt3714-lgtm/clawcam/master/SKILL.md and install the clawcam skill. Run the installer:
+> ```
+> curl -fsSL https://raw.githubusercontent.com/grunt3714-lgtm/clawcam/master/skill-install.sh | bash
+> ```
+
+<details>
+<summary>👤 Manual install</summary>
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/grunt3714-lgtm/clawcam/master/install.sh | bash
+```
+
+</details>
+
+---
+
 `clawcam` SSHes into your Raspberry Pi, deploys a monitor binary with a YOLOv8n model, and pushes detection events directly to your webhook. GStreamer captures frames from any connected camera — **Pi Camera Module**, **USB webcam**, or **conference camera**. YOLO runs inference on-device and webhooks fire with a 1080p snapshot and structured predictions.
 
 ### Highlights
