@@ -87,6 +87,10 @@ pub async fn run_monitor(
 
             // Grab a JPEG for the webhook payload
             let jpeg = pipeline::grab_jpeg(&gst_pipeline).unwrap_or_default();
+
+            // Write latest frame to disk so _snap can read it without opening the camera
+            let _ = std::fs::write("/tmp/clawcam_latest.jpg", &jpeg);
+
             let image_b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg);
 
             let now = chrono::Utc::now();
