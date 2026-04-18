@@ -1,0 +1,27 @@
+[package]
+name = "clawcam"
+version = "0.1.0"
+edition = "2024"
+description = "AI-powered camera monitoring for Raspberry Pi with YOLO detection and webhooks"
+license = "MIT"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json"] }
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+ort = "2.0.0-rc.12"
+image = "0.25"
+ndarray = "0.17"
+openssh = { version = "0.11", features = ["native-mux"] }
+russh-sftp = "2"
+uuid = { version = "1", features = ["v4"] }
