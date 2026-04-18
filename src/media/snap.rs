@@ -53,9 +53,9 @@ fn capture_fresh(out: &str) -> Result<()> {
     let source = detect_source();
 
     let pipeline = gst::parse::launch(&format!(
-        "{source} num-buffers=1 ! videoconvert ! videoscale ! \
+        "{source} ! videoconvert ! videoscale ! \
          video/x-raw,width=1920,height=1080 ! jpegenc quality=90 ! \
-         appsink name=sink emit-signals=true"
+         appsink name=sink emit-signals=true max-buffers=1 drop=true"
     ))
     .context("failed to create snap pipeline")?
     .downcast::<gst::Pipeline>()
