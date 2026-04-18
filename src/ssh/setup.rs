@@ -37,7 +37,7 @@ pub async fn run_setup(
     info!("deploying clawcam binary...");
     let arch = session::run_cmd(dev, "uname -m").await?;
     let arch = arch.trim();
-    session::run_cmd(dev, "sudo mkdir -p /usr/local/share/clawcam").await?;
+    session::run_cmd(dev, "sudo mkdir -p /usr/local/share/clawcam && rm -rf /tmp/clawcam /tmp/clawcam.service").await?;
 
     let local_bin = find_binary(arch);
     match local_bin {
@@ -200,10 +200,11 @@ async fn download_binary_to_device(dev: &Device, arch: &str) -> Result<()> {
         _ => anyhow::bail!("unsupported architecture: {arch}"),
     };
 
-    let url = get_release_asset_url(artifact).await?;
+    let tarball = format!("{artifact}.tar.gz");
+    let url = get_release_asset_url(&tarball).await?;
 
     session::run_cmd(dev, &format!(
-        "curl -fsSL '{url}' | tar xz -C /tmp && mv /tmp/{artifact} /tmp/clawcam"
+        "curl -fsSL -L '{url}' | tar xz -C /tmp && mv /tmp/{artifact} /tmp/clawcam"
     )).await.context(format!("failed to download {artifact} from GitHub release"))?;
 
     Ok(())
@@ -214,7 +215,7 @@ async fn download_model_to_device(dev: &Device) -> Result<()> {
     let url = get_release_asset_url("yolov8n.onnx").await?;
 
     session::run_cmd(dev, &format!(
-        "curl -fsSL '{url}' -o /tmp/yolov8n.onnx"
+        "curl -fsSL -L '{url}' -o /tmp/yolov8n.onnx"
     )).await.context("failed to download YOLO model from GitHub release")?;
 
     Ok(())
