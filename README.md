@@ -1,6 +1,7 @@
 <div align="center">
 
-# clawcam
+<img src="logo.svg" alt="clawcam" width="480"/>
+
 
 **AI-powered camera monitoring for Raspberry Pi**
 
