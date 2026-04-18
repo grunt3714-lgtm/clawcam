@@ -11,11 +11,11 @@
 [![Platform](https://img.shields.io/badge/platform-Raspberry_Pi-c51a4a?style=flat-square&logo=raspberrypi&logoColor=white)](https://www.raspberrypi.com/)
 [![YOLO](https://img.shields.io/badge/model-YOLOv8n-blueviolet?style=flat-square)](https://github.com/ultralytics/ultralytics)
 
-*Any camera. On-device YOLO. 1080p snapshots. Structured predictions. No cloud.*
+*Any camera. On-device YOLO. Object tracking. Adaptive events. Video clips. No cloud.*
 
 ```mermaid
 graph LR
-    PI["Raspberry Pi<br/><i>YOLOv8 + GStreamer</i>"] -->|"webhook POST<br/>1080p image + predictions"| HOOK["your API /<br/>OpenClaw hook"]
+    PI["Raspberry Pi<br/><i>YOLOv8 + GStreamer</i>"] -->|"webhook POST<br/>image + tracks + clips"| HOOK["your API /<br/>OpenClaw hook"]
 
     style PI fill:#1a1a2e,stroke:#e94560,color:#eee
     style HOOK fill:#533483,stroke:#e94560,color:#eee
@@ -45,19 +45,22 @@ curl -fsSL https://raw.githubusercontent.com/grunt3714-lgtm/clawcam/master/insta
 
 ---
 
-`clawcam` SSHes into your Raspberry Pi, deploys a monitor binary with a YOLOv8n model, and pushes detection events directly to your webhook. GStreamer captures frames from any connected camera — **Pi Camera Module**, **USB webcam**, or **conference camera**. YOLO runs inference on-device and webhooks fire with a 1080p snapshot and structured predictions.
+`clawcam` SSHes into your Raspberry Pi, deploys a monitor binary with a YOLOv8n model, and pushes detection events directly to your webhook. GStreamer captures frames from any connected camera — **Pi Camera Module**, **USB webcam**, or **conference camera**. YOLO runs inference on-device with adaptive object tracking, intelligent event management, and automatic video clip recording.
 
 ### Highlights
 
 - **Camera-agnostic** — Pi Camera Module (libcamera), USB webcams, conference cams (V4L2)
 - **On-device YOLO** — YOLOv8n via ONNX Runtime, no cloud inference
+- **Object tracking** — IoU-based frame-to-frame tracking with persistent track IDs, duration, and movement vectors
+- **Adaptive events** — intelligent lifecycle: initial alert → tracking updates → final report with clip. No spam for stationary objects, escalates for new arrivals
+- **Video clips** — automatic MP4 recording from a rolling frame buffer with 2s pre-detection context, assembled on event completion
+- **Pre-detection frames** — 3 JPEG frames from before the detection are included in the initial alert
 - **80 detection classes** — full COCO set (person, car, dog, cat, bicycle, etc.)
-- **1080p snapshots** — full-resolution JPEG captured at the moment of detection
-- **Structured predictions** — class, confidence score, and bounding box for each detection
+- **Configurable threshold** — `CLAWCAM_CONF_THRESHOLD` env var (default 0.6)
 - **Device registry** — name your cameras, manage them by friendly name
 - **Zero device setup** — `clawcam setup <name>` handles everything over SSH
-- **Boot persistence** — systemd service auto-starts on reboot
-- **Cloud-free** — all detection runs locally, events stay on your network
+- **Secure by default** — SSH host key verification, secrets in env files, HTTPS enforcement for public webhooks
+- **Cloud-free** — all detection and tracking runs locally, events stay on your network
 
 ## Install
 
@@ -103,7 +106,11 @@ That's it. The Pi will POST detection events with a 1080p snapshot and YOLO pred
 
 ## Webhook payload
 
-When a detection occurs, the Pi runs YOLO inference and POSTs:
+Each event produces up to 3 webhooks across its lifecycle:
+
+### Initial alert (`event_phase: "start"`)
+
+Fired when objects are first detected. Includes pre-detection frames for context.
 
 ```json
 {
@@ -115,16 +122,46 @@ When a detection occurs, the Pi runs YOLO inference and POSTs:
   "host": "192.168.1.50",
   "image": "<base64 1080p JPEG>",
   "predictions": [
-    {
-      "class": "person",
-      "class_id": 0,
-      "score": 0.87,
-      "left": 120,
-      "top": 80,
-      "right": 320,
-      "bottom": 430
-    }
-  ]
+    { "class": "person", "class_id": 0, "score": 0.87, "left": 120, "top": 80, "right": 320, "bottom": 430 }
+  ],
+  "event_id": "a3db45af-f756-43c2-8dea-aa30276903a5",
+  "event_phase": "start",
+  "tracks": [
+    { "track_id": 1, "class": "person", "duration_secs": 0.0, "movement_px": 0.0, "is_stationary": true, "bbox": [120, 80, 320, 430] }
+  ],
+  "pre_frames": ["<base64 JPEG>", "<base64 JPEG>", "<base64 JPEG>"]
+}
+```
+
+### Tracking update (`event_phase: "update"`)
+
+Sent for prolonged events (>3s) or new object arrivals. Rate-limited to every 10s.
+
+```json
+{
+  "detail": "ai_tracking_update",
+  "event_phase": "update",
+  "event_id": "a3db45af-...",
+  "tracks": [
+    { "track_id": 1, "class": "person", "duration_secs": 10.4, "movement_px": 245.3, "is_stationary": false, "bbox": [200, 90, 400, 440] }
+  ],
+  "event_duration_secs": 10.4
+}
+```
+
+`detail` is `"ai_new_arrival"` when a new object appears during an existing event.
+
+### Final report (`event_phase: "end"`)
+
+Sent 3s after all objects leave the frame. Includes an MP4 clip assembled from buffered frames.
+
+```json
+{
+  "detail": "ai_event_complete",
+  "event_phase": "end",
+  "event_id": "a3db45af-...",
+  "event_duration_secs": 18.1,
+  "clip": "<base64 MP4>"
 }
 ```
 
@@ -164,7 +201,7 @@ installing system dependencies...
 detecting camera...
 detected camera source: v4l2src device=/dev/video0
 deploying clawcam binary...
-deployed: clawcam 0.1.0
+deployed: clawcam 0.3.0
 deploying YOLO model...
 creating systemd service...
 setup complete — clawcam is active on barn-cam
@@ -188,32 +225,37 @@ clawcam clip barn-cam --dur 10 --out clip.mp4
 graph TD
     subgraph pi ["Raspberry Pi"]
         CAM["Camera<br/><i>Pi CSI / USB / V4L2</i>"] -->|frames| GST["GStreamer Pipeline"]
-        GST -->|"RGB 1280x720"| YOLO["YOLOv8n<br/><b>ONNX Runtime</b><br/><i>80 COCO classes</i>"]
-        GST -->|"JPEG 1080p"| SNAP["Snapshot Buffer"]
-        YOLO -->|detections| MON["clawcam monitor"]
-        SNAP -->|image| MON
-        MON -->|"POST: image + predictions"| HOOK
+        GST -->|"RGB 1280x720"| YOLO["YOLOv8n<br/><b>ONNX Runtime</b>"]
+        GST -->|"JPEG"| BUF["Frame Buffer<br/><i>3s rolling</i>"]
+        YOLO -->|detections| TRK["Object Tracker<br/><i>IoU matching</i>"]
+        TRK -->|tracks| EVT["Event Manager<br/><i>state machine</i>"]
+        BUF -->|"pre-frames + clip"| EVT
+        EVT -->|"start / update / end"| HOOK
     end
 
     subgraph host ["Host"]
-        HOOK["webhook endpoint"] -->|"JSON"| AGENT["OpenClaw / your API"]
+        HOOK["webhook endpoint"] -->|"JSON + clip"| AGENT["OpenClaw / your API"]
     end
 
     style pi fill:#1a1a2e,stroke:#e94560,color:#eee
     style host fill:#0d1117,stroke:#0f3460,color:#eee
     style YOLO fill:#533483,stroke:#e94560,color:#eee
-    style MON fill:#16213e,stroke:#0f3460,color:#eee
-    style SNAP fill:#16213e,stroke:#0f3460,color:#eee
+    style TRK fill:#16213e,stroke:#0f3460,color:#eee
+    style EVT fill:#16213e,stroke:#0f3460,color:#eee
+    style BUF fill:#16213e,stroke:#0f3460,color:#eee
     style HOOK fill:#533483,stroke:#e94560,color:#eee
     style AGENT fill:#533483,stroke:#0f3460,color:#eee
 ```
 
 1. **GStreamer** captures frames from the connected camera (auto-detected)
-2. Frames are split: RGB for inference, JPEG for snapshots
+2. Frames are split: RGB for inference, JPEG into a **3-second rolling buffer**
 3. **YOLOv8n** runs inference via ONNX Runtime (~2 FPS on Pi 4)
-4. When objects are detected above the confidence threshold, `clawcam monitor` fires a webhook
-5. The webhook includes the **1080p JPEG** and structured predictions with bounding boxes
-6. A **3-second cooldown** prevents rapid-fire duplicate events
+4. **Object tracker** matches detections across frames using IoU, assigns persistent track IDs, measures duration and movement
+5. **Event manager** decides what to report based on the state machine:
+   - **Initial alert** — first detection, includes 3 pre-detection frames
+   - **Tracking update** — objects persist >3s or new arrival (rate-limited to 10s)
+   - **Final report** — all objects gone for 3s, assembles MP4 clip from buffered frames via ffmpeg
+6. Stationary objects already reported are suppressed to avoid spam
 
 ### Supported cameras
 
@@ -242,7 +284,10 @@ Full 80-class COCO set. Most relevant for monitoring:
 |-----------|------|
 | **GStreamer** | Camera capture, frame scaling, JPEG encoding |
 | **ONNX Runtime** | YOLOv8n inference on CPU |
-| **clawcam monitor** | Detection loop, webhook dispatch, cooldown |
+| **Frame buffer** | 3s rolling JPEG ring buffer for pre/post-detection context |
+| **Object tracker** | IoU-based frame-to-frame matching, track IDs, movement |
+| **Event manager** | State machine: Idle → Active → Cooldown → Complete |
+| **ffmpeg** | Assembles buffered JPEG frames into MP4 clips |
 | **systemd** | Service management, boot persistence, auto-restart |
 
 ### File layout on device
@@ -252,6 +297,7 @@ Full 80-class COCO set. Most relevant for monitoring:
 | `/usr/local/bin/clawcam` | Monitor binary |
 | `/usr/local/share/clawcam/yolov8n.onnx` | YOLO model |
 | `/etc/systemd/system/clawcam.service` | systemd unit |
+| `/etc/clawcam.env` | Secrets (webhook token, mode 0600) |
 | `/var/log/clawcam.log` | Monitor log |
 
 ## License

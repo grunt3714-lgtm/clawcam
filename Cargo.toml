@@ -1,8 +1,8 @@
 [package]
 name = "clawcam"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "AI-powered camera monitoring for Raspberry Pi with YOLO detection and webhooks"
+description = "AI-powered camera monitoring for Raspberry Pi with YOLO detection, object tracking, and adaptive events"
 license = "MIT"
 
 [dependencies]
