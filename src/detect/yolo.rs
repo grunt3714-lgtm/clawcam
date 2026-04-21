@@ -28,6 +28,7 @@ const CLASS_NAMES: &[&str] = &[
 pub struct YoloDetector {
     session: Session,
     conf_threshold: f32,
+    class_allow: Option<std::collections::HashSet<String>>,
 }
 
 impl YoloDetector {
@@ -38,6 +39,13 @@ impl YoloDetector {
             .unwrap_or(DEFAULT_CONF_THRESHOLD)
             .clamp(0.1, 1.0);
 
+        let class_allow = std::env::var("CLAWCAM_CLASSES").ok().map(|s| {
+            s.split(',')
+                .map(|x| x.trim().to_lowercase())
+                .filter(|x| !x.is_empty())
+                .collect::<std::collections::HashSet<_>>()
+        });
+
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create session builder: {e}"))?
             .with_intra_threads(4)
@@ -45,8 +53,14 @@ impl YoloDetector {
             .commit_from_file(model_path)
             .map_err(|e| anyhow::anyhow!("failed to load model from {model_path}: {e}"))?;
 
-        tracing::info!("confidence threshold: {conf_threshold}");
-        Ok(Self { session, conf_threshold })
+        tracing::info!(
+            "confidence threshold: {conf_threshold}; class allowlist: {}",
+            class_allow
+                .as_ref()
+                .map(|s| s.iter().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_else(|| "(all)".into())
+        );
+        Ok(Self { session, conf_threshold, class_allow })
     }
 
     /// Run inference on an RGB frame. Returns detections scaled to original image dimensions.
@@ -80,7 +94,10 @@ impl YoloDetector {
         let output_2d = ArrayView2::from_shape((rows, cols), slice)
             .context("shape mismatch on output tensor")?;
 
-        let detections = postprocess(output_2d, img_width, img_height, self.conf_threshold);
+        let mut detections = postprocess(output_2d, img_width, img_height, self.conf_threshold);
+        if let Some(allow) = &self.class_allow {
+            detections.retain(|d| allow.contains(&d.class.to_lowercase()));
+        }
         Ok(detections)
     }
 }

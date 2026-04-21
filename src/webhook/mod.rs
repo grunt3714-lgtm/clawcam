@@ -24,6 +24,16 @@ pub struct TrackInfo {
     pub bbox: [u32; 4],
 }
 
+/// Per-inference bbox sample tagged to a position in the assembled clip.
+/// `t` is playback seconds from the start of the clip (clip is assembled at
+/// a fixed 10 FPS, so `t = frame_index / 10.0`).
+#[derive(Debug, Clone, Serialize)]
+pub struct ClipPredSample {
+    pub frame_index: usize,
+    pub t: f64,
+    pub boxes: Vec<Detection>,
+}
+
 #[derive(Debug, Serialize)]
 pub struct WebhookPayload {
     pub ts: String,
@@ -57,6 +67,12 @@ pub struct WebhookPayload {
     /// Pre-detection JPEG frames as base64 (sent on "start" phase only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pre_frames: Option<Vec<String>>,
+
+    /// Per-inference bbox samples indexed into the assembled clip (sent on
+    /// "end" phase only). Used by the UI to draw animated overlays synced to
+    /// video playback time.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_predictions: Option<Vec<ClipPredSample>>,
 }
 
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(30);

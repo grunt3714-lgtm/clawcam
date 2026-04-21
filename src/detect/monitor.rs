@@ -10,8 +10,10 @@ use crate::detect::frame_buffer::{FrameBuffer, TimestampedFrame};
 use crate::detect::pipeline;
 use crate::detect::tracker::ObjectTracker;
 use crate::detect::yolo::YoloDetector;
-use crate::webhook::{self, Detection, TrackInfo, WebhookPayload};
+use crate::webhook::{self, ClipPredSample, Detection, TrackInfo, WebhookPayload};
 
+// We don't videorate-throttle in GStreamer (negotiation is fragile), so this
+// is the effective YOLO inference cadence.
 const INFERENCE_INTERVAL: Duration = Duration::from_millis(500);
 const FRAME_BUFFER_CAPACITY: usize = 30; // ~3s at 10 FPS
 const PRE_ROLL_FRAMES: usize = 20; // ~2s of pre-detection context for clips
@@ -72,12 +74,45 @@ pub async fn run_monitor(
 
     info!("starting monitor: camera={camera_source} model={model_path}");
 
+    // Optional PTZ control server for motorized conference cams (VISCA over serial).
+    // Spawned only when CLAWCAM_PTZ_SERIAL is set. Binds to CLAWCAM_PTZ_BIND
+    // (default 0.0.0.0:8091) and writes VISCA commands to the serial device.
+    if let Ok(serial) = std::env::var("CLAWCAM_PTZ_SERIAL") {
+        let bind = std::env::var("CLAWCAM_PTZ_BIND")
+            .unwrap_or_else(|_| "0.0.0.0:8091".to_string());
+        tokio::spawn(async move {
+            if let Err(e) = crate::ptz::serve(bind, serial).await {
+                warn!("PTZ server exited: {e:#}");
+            }
+        });
+    }
+
     let mut detector = YoloDetector::load(&model_path)?;
     info!("YOLO model loaded");
 
-    let (frame_rx, gst_pipeline) = pipeline::create_pipeline(&camera_source, 1280, 720, 10)?;
+    let stream_url_owned = std::env::var("CLAWCAM_STREAM_URL")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    let stream_url = stream_url_owned.as_deref();
+    let stream_width = std::env::var("CLAWCAM_STREAM_WIDTH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1280u32);
+    let stream_height = std::env::var("CLAWCAM_STREAM_HEIGHT")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(720u32);
+    let stream_fps = std::env::var("CLAWCAM_STREAM_FPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(20u32);
+    let (frame_rx, gst_pipeline) =
+        pipeline::create_pipeline(&camera_source, stream_width, stream_height, stream_fps, stream_url)?;
     gst_pipeline.set_state(gstreamer::State::Playing)?;
     info!("pipeline started");
+
+    let telemetry_url = std::env::var("CLAWCAM_TELEMETRY_URL").ok();
+    let telemetry_token = webhook_token_owned.clone();
 
     // Adaptive monitoring components
     let mut frame_buffer = FrameBuffer::new(FRAME_BUFFER_CAPACITY);
@@ -85,6 +120,7 @@ pub async fn run_monitor(
     let mut event_mgr = EventManager::new();
     let mut event_id: Option<String> = None;
     let mut clip_frames: Vec<TimestampedFrame> = Vec::new();
+    let mut clip_preds: Vec<ClipPredSample> = Vec::new();
 
     loop {
         let frame = match frame_rx.recv_timeout(Duration::from_secs(5)) {
@@ -136,8 +172,25 @@ pub async fn run_monitor(
             }
         };
 
+        // While recording, stash a bbox sample indexed to the clip frame just pushed.
+        // Clip is assembled at a fixed 10 FPS (see `assemble_clip`), so playback
+        // `t = frame_index / 10.0`.
+        if event_mgr.is_recording() && !clip_frames.is_empty() {
+            let idx = clip_frames.len() - 1;
+            clip_preds.push(ClipPredSample {
+                frame_index: idx,
+                t: idx as f64 / 10.0,
+                boxes: detections.clone(),
+            });
+        }
+
         // Update tracker
         let tracks = tracker.update(&detections);
+
+        // Push telemetry (every inference cycle) so the web UI can draw live overlays.
+        if let Some(url) = telemetry_url.as_deref() {
+            fire_telemetry(url, telemetry_token.as_deref(), &hostname, frame.width, frame.height, &detections, &tracks);
+        }
         let has_new = event_mgr
             .event_start()
             .map(|s| tracker.has_new_arrivals_since(s))
@@ -155,6 +208,9 @@ pub async fn run_monitor(
 
                 // Seed clip buffer with pre-roll frames
                 clip_frames = frame_buffer.clone_recent(PRE_ROLL_FRAMES);
+                // Pre-roll frames have no bbox samples (no inference was run on them).
+                // Start fresh so per-frame bboxes align with the assembled clip.
+                clip_preds.clear();
 
                 // Build pre-detection frames for the webhook
                 let pre = frame_buffer
@@ -179,6 +235,7 @@ pub async fn run_monitor(
                     None,
                     None,
                     Some(pre),
+                    None,
                 );
             }
 
@@ -203,6 +260,7 @@ pub async fn run_monitor(
                         eid,
                         &trks,
                         dur,
+                        None,
                         None,
                         None,
                     );
@@ -250,11 +308,13 @@ pub async fn run_monitor(
                         Some(dur_secs),
                         clip_b64.as_deref(),
                         None,
+                        Some(std::mem::take(&mut clip_preds)),
                     );
                 }
 
                 event_id = None;
                 clip_frames.clear();
+                clip_preds.clear();
             }
         }
 
@@ -318,6 +378,7 @@ fn fire_webhook(
     event_duration_secs: Option<f64>,
     clip: Option<&str>,
     pre_frames: Option<Vec<String>>,
+    clip_predictions: Option<Vec<ClipPredSample>>,
 ) {
     let now = chrono::Utc::now();
     let payload = WebhookPayload {
@@ -335,6 +396,7 @@ fn fire_webhook(
         event_duration_secs,
         clip: clip.map(String::from),
         pre_frames,
+        clip_predictions,
     };
 
     let url = webhook_url.to_string();
@@ -343,6 +405,41 @@ fn fire_webhook(
         if let Err(e) = webhook::send(&url, token.as_deref(), &payload).await {
             warn!("webhook send failed: {e}");
         }
+    });
+}
+
+fn fire_telemetry(
+    url: &str,
+    token: Option<&str>,
+    hostname: &str,
+    width: u32,
+    height: u32,
+    detections: &[Detection],
+    tracks: &[crate::detect::tracker::TrackedObject],
+) {
+    let body = serde_json::json!({
+        "host": hostname,
+        "epoch_ms": chrono::Utc::now().timestamp_millis(),
+        "width": width,
+        "height": height,
+        "predictions": detections,
+        "tracks": build_track_info(tracks),
+    });
+    let url = url.to_string();
+    let tok = token.map(String::from);
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(3))
+            .build()
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        let mut req = client.post(&url).json(&body);
+        if let Some(t) = tok {
+            req = req.bearer_auth(t);
+        }
+        let _ = req.send().await;
     });
 }
 
