@@ -2,6 +2,8 @@ use anyhow::{Context, Result};
 use base64::Engine;
 use gstreamer::prelude::*;
 use std::os::unix::fs::PermissionsExt;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info, warn};
 
@@ -123,6 +125,37 @@ pub async fn run_monitor(
     gst_pipeline.set_state(gstreamer::State::Playing)?;
     info!("pipeline started");
 
+    // Install shutdown handler. The main loop polls this flag each iteration;
+    // on SIGTERM/SIGINT we break out and flush an end-phase webhook for any
+    // event that's still active, so the app doesn't leave it stuck as "active"
+    // with no clip when systemd restarts the service mid-event.
+    let shutdown = Arc::new(AtomicBool::new(false));
+    {
+        let shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = match signal(SignalKind::terminate()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("failed to install SIGTERM handler: {e}");
+                    return;
+                }
+            };
+            let mut intr = match signal(SignalKind::interrupt()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("failed to install SIGINT handler: {e}");
+                    return;
+                }
+            };
+            tokio::select! {
+                _ = term.recv() => info!("SIGTERM received, initiating shutdown"),
+                _ = intr.recv() => info!("SIGINT received, initiating shutdown"),
+            }
+            shutdown.store(true, Ordering::SeqCst);
+        });
+    }
+
     let telemetry_url = std::env::var("CLAWCAM_TELEMETRY_URL").ok();
     let telemetry_token = webhook_token_owned.clone();
 
@@ -141,6 +174,9 @@ pub async fn run_monitor(
     const INFER_LOG_EVERY: u32 = 40;
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
         // Pull a frame and then drain any backlog, keeping only the newest.
         // The GStreamer mpsc channel fills while inference runs, and while
         // the PTZ motor is mid-burst the backlog contains stale frames that
@@ -364,6 +400,70 @@ pub async fn run_monitor(
         }
 
         tokio::time::sleep(inference_interval).await;
+    }
+
+    // If we're shutting down mid-event, synthesize an end-phase webhook so the
+    // app can close the event out with whatever clip we've managed to buffer
+    // (even a partial clip is better than a permanently-"active" stranded row).
+    if let Some(eid) = event_id.take() {
+        let dur_secs = event_mgr
+            .event_start()
+            .map(|s| s.elapsed().as_secs_f64())
+            .unwrap_or(0.0);
+        warn!(
+            "shutdown with active event {eid}: flushing end-phase webhook ({:.1}s, {} frames)",
+            dur_secs,
+            clip_frames.len()
+        );
+
+        let clip_b64 = if clip_frames.len() > 10 {
+            match assemble_clip(&clip_frames, &frame_dir).await {
+                Ok(data) => Some(data),
+                Err(e) => {
+                    warn!("shutdown clip assembly failed: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let last_jpeg = frame_buffer
+            .recent(1)
+            .first()
+            .map(|f| f.jpeg.clone())
+            .unwrap_or_default();
+        let last_tracks = tracker.active_tracks().to_vec();
+
+        let now = chrono::Utc::now();
+        let payload = WebhookPayload {
+            ts: now.format("%b %d %H:%M:%S").to_string(),
+            epoch: now.timestamp(),
+            event_type: "motion".to_string(),
+            detail: "ai_event_shutdown_flush".to_string(),
+            source: "clawcam".to_string(),
+            host: hostname.clone(),
+            image: b64(&last_jpeg),
+            predictions: Vec::new(),
+            event_id: Some(eid.clone()),
+            event_phase: Some("end".to_string()),
+            tracks: Some(build_track_info(&last_tracks)),
+            event_duration_secs: Some(dur_secs),
+            clip: clip_b64,
+            pre_frames: None,
+            clip_predictions: Some(std::mem::take(&mut clip_preds)),
+        };
+
+        match tokio::time::timeout(
+            Duration::from_secs(10),
+            webhook::send(webhook_url, webhook_token, &payload),
+        )
+        .await
+        {
+            Ok(Ok(())) => info!("shutdown end webhook delivered for {eid}"),
+            Ok(Err(e)) => warn!("shutdown end webhook failed: {e}"),
+            Err(_) => warn!("shutdown end webhook timed out after 10s"),
+        }
     }
 
     gst_pipeline.set_state(gstreamer::State::Null)?;
