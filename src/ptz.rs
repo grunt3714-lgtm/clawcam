@@ -98,13 +98,24 @@ async fn handle(mut sock: TcpStream, serial: &str, token: Option<&str>) -> Resul
         }
     }
 
-    let cmd: PtzCmd = match serde_json::from_str(&body) {
+    let mut cmd: PtzCmd = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(e) => {
             let msg = format!(r#"{{"error":"bad body: {e}"}}"#);
             return respond(&mut sock, 400, &msg).await;
         }
     };
+
+    // Apply installation-level sign flips so every client (auto-tracker,
+    // web UI, CLI) produces the same motor behavior regardless of how the
+    // camera is physically mounted. For an upside-down mount, set
+    // `CLAWCAM_PTZ_PAN_INVERT=1` and `CLAWCAM_PTZ_TILT_INVERT=1`.
+    if std::env::var("CLAWCAM_PTZ_PAN_INVERT").ok().as_deref() == Some("1") {
+        cmd.pan = -cmd.pan;
+    }
+    if std::env::var("CLAWCAM_PTZ_TILT_INVERT").ok().as_deref() == Some("1") {
+        cmd.tilt = -cmd.tilt;
+    }
 
     let addr_byte = 0x80 | (cmd.address & 0x0F);
     let primary = build_visca(addr_byte, &cmd);
@@ -113,11 +124,25 @@ async fn handle(mut sock: TcpStream, serial: &str, token: Option<&str>) -> Resul
         return respond(&mut sock, 502, &msg).await;
     }
 
-    // For nudges (pan/tilt/zoom direction), auto-stop after duration_ms so a
-    // click produces a short motion rather than running forever.
+    // For nudges (pan/tilt/zoom direction), re-send the drive command at a
+    // short interval throughout `duration_ms` and finish with a stop. Many
+    // budget PTZ cams treat a single Pan/Tilt-Drive as a ~100ms burst rather
+    // than continuous motion (as the VISCA spec describes), so a single
+    // start + long sleep + stop produces only a tiny nudge. Repeating the
+    // drive keeps the motor running for the full requested duration.
     let has_motion = cmd.pan != 0 || cmd.tilt != 0 || cmd.zoom != 0;
     if has_motion && !cmd.home && !cmd.stop && cmd.duration_ms > 0 {
-        tokio::time::sleep(Duration::from_millis(cmd.duration_ms)).await;
+        const REPEAT_INTERVAL_MS: u64 = 80;
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(cmd.duration_ms);
+        loop {
+            tokio::time::sleep(Duration::from_millis(REPEAT_INTERVAL_MS)).await;
+            if tokio::time::Instant::now() >= deadline {
+                break;
+            }
+            if write_serial(serial, &primary).is_err() {
+                break;
+            }
+        }
         let stop = stop_all_visca(addr_byte, cmd.pan != 0 || cmd.tilt != 0, cmd.zoom != 0);
         let _ = write_serial(serial, &stop);
     }
@@ -170,9 +195,17 @@ struct PtzCmd {
     duration_ms: u64,
     #[serde(default = "default_address")]
     address: u8,
+    /// VISCA pan drive speed 0x01..=0x18 (1..=24). Omitted → default.
+    #[serde(default)]
+    pan_speed: Option<u8>,
+    /// VISCA tilt drive speed 0x01..=0x14 (1..=20). Omitted → default.
+    #[serde(default)]
+    tilt_speed: Option<u8>,
 }
 fn default_duration() -> u64 { 300 }
 fn default_address() -> u8 { 1 }
+const DEFAULT_PAN_SPEED: u8 = 0x10;
+const DEFAULT_TILT_SPEED: u8 = 0x10;
 
 // VISCA byte sequences. See: https://www.epiphan.com/userguides/LUMiO12x/Content/UserGuides/PTZ/3-operation/VISCAcommands.htm
 fn build_visca(addr: u8, cmd: &PtzCmd) -> Vec<u8> {
@@ -198,7 +231,9 @@ fn build_visca(addr: u8, cmd: &PtzCmd) -> Vec<u8> {
         1 => 0x01,  // up
         _ => 0x03,  // stop
     };
-    vec![addr, 0x01, 0x06, 0x01, 0x10, 0x10, pan_dir, tilt_dir, 0xFF]
+    let pan_speed = cmd.pan_speed.unwrap_or(DEFAULT_PAN_SPEED).clamp(0x01, 0x18);
+    let tilt_speed = cmd.tilt_speed.unwrap_or(DEFAULT_TILT_SPEED).clamp(0x01, 0x14);
+    vec![addr, 0x01, 0x06, 0x01, pan_speed, tilt_speed, pan_dir, tilt_dir, 0xFF]
 }
 
 fn stop_all_visca(addr: u8, pan_tilt: bool, zoom: bool) -> Vec<u8> {

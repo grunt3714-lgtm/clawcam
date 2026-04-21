@@ -8,13 +8,14 @@ use tracing::{info, warn};
 use crate::detect::event::{EventDecision, EventManager, UpdateReason};
 use crate::detect::frame_buffer::{FrameBuffer, TimestampedFrame};
 use crate::detect::pipeline;
+use crate::detect::ptz_track::PtzTracker;
 use crate::detect::tracker::ObjectTracker;
 use crate::detect::yolo::YoloDetector;
 use crate::webhook::{self, ClipPredSample, Detection, TrackInfo, WebhookPayload};
 
 // We don't videorate-throttle in GStreamer (negotiation is fragile), so this
-// is the effective YOLO inference cadence.
-const INFERENCE_INTERVAL: Duration = Duration::from_millis(500);
+// is the effective YOLO inference cadence. Override with CLAWCAM_INFERENCE_INTERVAL_MS.
+const DEFAULT_INFERENCE_INTERVAL_MS: u64 = 100;
 const FRAME_BUFFER_CAPACITY: usize = 30; // ~3s at 10 FPS
 const PRE_ROLL_FRAMES: usize = 20; // ~2s of pre-detection context for clips
 const PRE_FRAMES_IN_ALERT: usize = 3; // frames to include in initial webhook
@@ -87,8 +88,19 @@ pub async fn run_monitor(
         });
     }
 
+    let inference_interval = Duration::from_millis(
+        std::env::var("CLAWCAM_INFERENCE_INTERVAL_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(DEFAULT_INFERENCE_INTERVAL_MS),
+    );
+    info!("inference interval: {} ms", inference_interval.as_millis());
+
     let mut detector = YoloDetector::load(&model_path)?;
     info!("YOLO model loaded");
+
+    // Optional PTZ auto-tracker (UVC). Disabled unless CLAWCAM_PTZ_TRACK=1.
+    let mut ptz_tracker = PtzTracker::from_env();
 
     let stream_url_owned = std::env::var("CLAWCAM_STREAM_URL")
         .ok()
@@ -122,8 +134,19 @@ pub async fn run_monitor(
     let mut clip_frames: Vec<TimestampedFrame> = Vec::new();
     let mut clip_preds: Vec<ClipPredSample> = Vec::new();
 
+    // Rolling inference timing, logged every N cycles so users can tune
+    // CLAWCAM_YOLO_INPUT_SIZE / CLAWCAM_INFERENCE_INTERVAL_MS.
+    let mut infer_ms_sum: u128 = 0;
+    let mut infer_count: u32 = 0;
+    const INFER_LOG_EVERY: u32 = 40;
+
     loop {
-        let frame = match frame_rx.recv_timeout(Duration::from_secs(5)) {
+        // Pull a frame and then drain any backlog, keeping only the newest.
+        // The GStreamer mpsc channel fills while inference runs, and while
+        // the PTZ motor is mid-burst the backlog contains stale frames that
+        // would make the tracker overshoot (acting on where the subject was,
+        // not where it is). Always inference on what's current.
+        let mut frame = match frame_rx.recv_timeout(Duration::from_secs(5)) {
             Ok(f) => f,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 warn!("no frame received in 5s, pipeline may be stalled");
@@ -131,6 +154,14 @@ pub async fn run_monitor(
             }
             Err(_) => break,
         };
+        let mut dropped = 0u32;
+        while let Ok(newer) = frame_rx.try_recv() {
+            frame = newer;
+            dropped += 1;
+        }
+        if dropped > 0 {
+            tracing::debug!("dropped {dropped} stale frames before inference");
+        }
 
         // Grab JPEG for buffer and latest-frame file
         let jpeg = match pipeline::grab_jpeg(&gst_pipeline) {
@@ -164,6 +195,7 @@ pub async fn run_monitor(
         }
 
         // Run inference
+        let infer_start = std::time::Instant::now();
         let detections = match detector.detect(&frame.data, frame.width, frame.height) {
             Ok(d) => d,
             Err(e) => {
@@ -171,6 +203,14 @@ pub async fn run_monitor(
                 continue;
             }
         };
+        infer_ms_sum += infer_start.elapsed().as_millis();
+        infer_count += 1;
+        if infer_count >= INFER_LOG_EVERY {
+            let avg = infer_ms_sum as f64 / infer_count as f64;
+            info!("inference: avg {:.1} ms over last {} frames", avg, infer_count);
+            infer_ms_sum = 0;
+            infer_count = 0;
+        }
 
         // While recording, stash a bbox sample indexed to the clip frame just pushed.
         // Clip is assembled at a fixed 10 FPS (see `assemble_clip`), so playback
@@ -186,6 +226,11 @@ pub async fn run_monitor(
 
         // Update tracker
         let tracks = tracker.update(&detections);
+
+        // Steer the camera to keep the most persistent subject centered.
+        if let Some(pt) = ptz_tracker.as_mut() {
+            pt.update(&tracks, frame.width, frame.height);
+        }
 
         // Push telemetry (every inference cycle) so the web UI can draw live overlays.
         if let Some(url) = telemetry_url.as_deref() {
@@ -318,7 +363,7 @@ pub async fn run_monitor(
             }
         }
 
-        tokio::time::sleep(INFERENCE_INTERVAL).await;
+        tokio::time::sleep(inference_interval).await;
     }
 
     gst_pipeline.set_state(gstreamer::State::Null)?;

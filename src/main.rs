@@ -4,6 +4,7 @@ mod detect;
 mod media;
 mod ssh;
 mod ptz;
+mod update;
 mod webhook;
 
 use clap::Parser;

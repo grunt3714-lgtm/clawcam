@@ -80,10 +80,53 @@ clawcam snap barn-cam --out shot.jpg
 clawcam clip barn-cam --dur 10 --out clip.mp4
 ```
 
-### 6. Teardown
+### 6. Pan / Tilt / Zoom (VISCA conference cameras)
+
+PTZ drives VISCA commands over the on-device serial port (configured via `CLAWCAM_PTZ_SERIAL` on the Pi, exposed as an HTTP server on port 8091). This is the same control path as the clawcam-app web UI — any motion that works in the browser works here.
+
+> Heads-up: many cheap USB webcams advertise UVC PTZ descriptors but don't have physical motors. `clawcam ptz` does **not** use `v4l2-ctl` — it only drives real VISCA-capable conference cams connected to a serial (USB-to-RS-232 adapter) interface.
+
+```bash
+# Return the camera to its home/center position
+clawcam ptz pond-cam center
+
+# Stop all motion immediately
+clawcam ptz pond-cam stop
+
+# Direction burst, each axis is -1, 0, or +1. Auto-stops after --duration ms.
+# pan:  -1 = left, +1 = right
+# tilt: -1 = down, +1 = up
+# zoom: -1 = wide, +1 = tele
+clawcam ptz pond-cam nudge --pan +1 --duration 500
+clawcam ptz pond-cam nudge --tilt -1
+clawcam ptz pond-cam nudge --zoom +1 --duration 200
+```
+
+Auto-tracking (object-follow) runs inside the on-device monitor and POSTs the same direction bursts to `http://127.0.0.1:8091/ptz`. Configure via `CLAWCAM_PTZ_*` env — see below.
+
+### 7. Teardown
 Stop the on-device monitor and clean up.
 ```bash
 clawcam teardown barn-cam
+```
+
+### 8. Update
+
+Pull the latest release from GitHub and replace the binary. Works for the local install or any registered device.
+
+```bash
+# Update the local clawcam binary
+clawcam update
+
+# Update a specific device (SSHes, installs to /usr/local/bin, restarts service)
+clawcam update pond-cam
+
+# Update every registered device
+clawcam update --all
+
+# Pin a specific version (applies to any variant above)
+clawcam update --version v0.4.1
+clawcam update pond-cam --version v0.4.1
 ```
 
 ## Webhook Payload
@@ -163,6 +206,25 @@ The on-device monitor reads (set via `/etc/clawcam.env`):
 | `CLAWCAM_WEBHOOK` | Webhook URL | *(required)* |
 | `CLAWCAM_WEBHOOK_TOKEN` | Bearer token for webhook auth | *(optional)* |
 | `CLAWCAM_CONF_THRESHOLD` | Detection confidence threshold (0.1–1.0) | `0.6` |
+| `CLAWCAM_INFERENCE_INTERVAL_MS` | Sleep between YOLO inferences. Lower = more FPS, more CPU | `100` |
+| `CLAWCAM_YOLO_INPUT_SIZE` | YOLO input dimensions (multiples of 32). 320/416 are big Pi CPU speedups | `640` |
+
+### Auto-tracking (UVC cameras only)
+
+Set these in `/etc/clawcam.env` to make the camera follow the most persistent detection:
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `CLAWCAM_PTZ_TRACK` | `1` to enable auto-tracking | *(disabled)* |
+| `CLAWCAM_PTZ_HTTP` | VISCA server endpoint the tracker POSTs to | `http://127.0.0.1:8091/ptz` |
+| `CLAWCAM_PTZ_TOKEN` | Bearer token, if the VISCA server requires one | *(optional)* |
+| `CLAWCAM_PTZ_DEADZONE_PCT` | % of half-frame where camera won't move | `10` |
+| `CLAWCAM_PTZ_GAIN` | Scales burst duration with offset magnitude | `1.0` |
+| `CLAWCAM_PTZ_MIN_DURATION_MS` | Shortest motion burst issued when outside the deadzone | `120` |
+| `CLAWCAM_PTZ_MAX_DURATION_MS` | Longest motion burst (when target is near the frame edge) | `700` |
+| `CLAWCAM_PTZ_PAN_INVERT` | `1` to flip pan direction (e.g. upside-down mount) | *(no)* |
+| `CLAWCAM_PTZ_TILT_INVERT` | `1` to flip tilt direction | *(no)* |
+| `CLAWCAM_PTZ_RECENTER_SEC` | Seconds of no tracks before issuing a home() (0/unset = never) | *(disabled)* |
 
 ## Troubleshooting
 
@@ -170,5 +232,7 @@ The on-device monitor reads (set via `/etc/clawcam.env`):
 - **SSH failures:** Verify your SSH keys are authorized on the Pi (`ssh-copy-id pi@<ip>`).
 - **Service not starting:** Check logs with `journalctl -u clawcam` on the Pi.
 - **Low detection accuracy:** Try a larger YOLO model (yolov8s.onnx) at the cost of inference speed.
-- **Slow inference:** YOLOv8n runs at ~2 FPS on Pi 4. Consider reducing resolution or inference interval.
+- **Slow inference:** Out of the box YOLOv8n runs around 3–5 FPS on Pi 4 CPU. To go faster, drop `CLAWCAM_YOLO_INPUT_SIZE` (try 416 or 320 — roughly quadratic speedup) and/or lower `CLAWCAM_INFERENCE_INTERVAL_MS`. Check actual inference latency in the journal: the monitor logs `inference: avg N.N ms over last 40 frames` periodically.
+- **PTZ commands fail with "permission denied":** The SSH user needs access to the v4l2 device. On Debian/Raspberry Pi OS, add the user to the `video` group: `sudo usermod -aG video <user>` then re-login.
+- **PTZ moves in the wrong direction:** UVC sign conventions vary by camera. Flip with `CLAWCAM_PTZ_PAN_INVERT=1` and/or `CLAWCAM_PTZ_TILT_INVERT=1` in `/etc/clawcam.env` for auto-tracking. For manual `clawcam ptz ... nudge`, pass the opposite sign.
 - **Empty predictions:** If `predictions` is empty, nothing exceeded the 0.4 confidence threshold in the frame.

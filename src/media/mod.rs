@@ -1,6 +1,7 @@
 pub mod snap;
 pub mod clip;
 pub mod audio;
+pub mod ptz;
 
 /// Detect the GStreamer camera source to use.
 /// Checks CLAWCAM_CAMERA_SOURCE env var first, then probes GStreamer

@@ -5,7 +5,7 @@ use ort::value::Tensor;
 
 use crate::webhook::Detection;
 
-const INPUT_SIZE: u32 = 640;
+const DEFAULT_INPUT_SIZE: u32 = 640;
 const DEFAULT_CONF_THRESHOLD: f32 = 0.6;
 const IOU_THRESHOLD: f32 = 0.45;
 
@@ -29,6 +29,7 @@ pub struct YoloDetector {
     session: Session,
     conf_threshold: f32,
     class_allow: Option<std::collections::HashSet<String>>,
+    input_size: u32,
 }
 
 impl YoloDetector {
@@ -46,6 +47,16 @@ impl YoloDetector {
                 .collect::<std::collections::HashSet<_>>()
         });
 
+        // YOLO inference scales quadratically with input size. 640 is stock YOLOv8
+        // training size; 416/320 trade accuracy for a big speedup on Pi CPU.
+        let input_size = std::env::var("CLAWCAM_YOLO_INPUT_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<u32>().ok())
+            .map(|v| v.clamp(160, 1280))
+            .map(|v| (v / 32) * 32) // YOLO needs multiples of 32
+            .filter(|v| *v >= 160)
+            .unwrap_or(DEFAULT_INPUT_SIZE);
+
         let session = Session::builder()
             .map_err(|e| anyhow::anyhow!("failed to create session builder: {e}"))?
             .with_intra_threads(4)
@@ -54,13 +65,13 @@ impl YoloDetector {
             .map_err(|e| anyhow::anyhow!("failed to load model from {model_path}: {e}"))?;
 
         tracing::info!(
-            "confidence threshold: {conf_threshold}; class allowlist: {}",
+            "confidence threshold: {conf_threshold}; input: {input_size}×{input_size}; class allowlist: {}",
             class_allow
                 .as_ref()
                 .map(|s| s.iter().cloned().collect::<Vec<_>>().join(","))
                 .unwrap_or_else(|| "(all)".into())
         );
-        Ok(Self { session, conf_threshold, class_allow })
+        Ok(Self { session, conf_threshold, class_allow, input_size })
     }
 
     /// Run inference on an RGB frame. Returns detections scaled to original image dimensions.
@@ -70,7 +81,7 @@ impl YoloDetector {
         img_width: u32,
         img_height: u32,
     ) -> Result<Vec<Detection>> {
-        let input = preprocess(rgb_data, img_width, img_height)?;
+        let input = preprocess(rgb_data, img_width, img_height, self.input_size)?;
 
         let input_tensor = Tensor::from_array(input)
             .map_err(|e| anyhow::anyhow!("failed to create input tensor: {e}"))?;
@@ -94,7 +105,7 @@ impl YoloDetector {
         let output_2d = ArrayView2::from_shape((rows, cols), slice)
             .context("shape mismatch on output tensor")?;
 
-        let mut detections = postprocess(output_2d, img_width, img_height, self.conf_threshold);
+        let mut detections = postprocess(output_2d, img_width, img_height, self.input_size, self.conf_threshold);
         if let Some(allow) = &self.class_allow {
             detections.retain(|d| allow.contains(&d.class.to_lowercase()));
         }
@@ -103,24 +114,32 @@ impl YoloDetector {
 }
 
 /// Preprocess RGB image to NCHW float32 tensor normalized to [0, 1].
-fn preprocess(rgb_data: &[u8], width: u32, height: u32) -> Result<Array<f32, ndarray::Ix4>> {
+fn preprocess(
+    rgb_data: &[u8],
+    width: u32,
+    height: u32,
+    input_size: u32,
+) -> Result<Array<f32, ndarray::Ix4>> {
     let img = image::RgbImage::from_raw(width, height, rgb_data.to_vec())
         .context("invalid RGB data dimensions")?;
 
     let resized = image::imageops::resize(
         &img,
-        INPUT_SIZE,
-        INPUT_SIZE,
+        input_size,
+        input_size,
         image::imageops::FilterType::Triangle,
     );
 
-    let mut input = Array::zeros((1, 3, INPUT_SIZE as usize, INPUT_SIZE as usize));
-    for y in 0..INPUT_SIZE as usize {
-        for x in 0..INPUT_SIZE as usize {
-            let pixel = resized.get_pixel(x as u32, y as u32);
-            input[[0, 0, y, x]] = pixel[0] as f32 / 255.0;
-            input[[0, 1, y, x]] = pixel[1] as f32 / 255.0;
-            input[[0, 2, y, x]] = pixel[2] as f32 / 255.0;
+    let side = input_size as usize;
+    let raw = resized.into_raw(); // Vec<u8>, interleaved RGB rows, len = side*side*3
+    let mut input = Array::zeros((1, 3, side, side));
+    for y in 0..side {
+        let row = &raw[y * side * 3..(y + 1) * side * 3];
+        for x in 0..side {
+            let p = &row[x * 3..x * 3 + 3];
+            input[[0, 0, y, x]] = p[0] as f32 / 255.0;
+            input[[0, 1, y, x]] = p[1] as f32 / 255.0;
+            input[[0, 2, y, x]] = p[2] as f32 / 255.0;
         }
     }
 
@@ -133,14 +152,15 @@ fn postprocess(
     output: ArrayView2<f32>,
     img_width: u32,
     img_height: u32,
+    input_size: u32,
     conf_threshold: f32,
 ) -> Vec<Detection> {
     // YOLOv8 output: [84, 8400] — transpose to [8400, 84]
     let output = output.t();
     let num_boxes = output.nrows();
 
-    let scale_x = img_width as f32 / INPUT_SIZE as f32;
-    let scale_y = img_height as f32 / INPUT_SIZE as f32;
+    let scale_x = img_width as f32 / input_size as f32;
+    let scale_y = img_height as f32 / input_size as f32;
 
     let mut candidates: Vec<Detection> = Vec::new();
 

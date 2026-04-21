@@ -92,6 +92,32 @@ pub enum Command {
         name: String,
     },
 
+    /// Update clawcam to the latest GitHub release
+    Update {
+        /// Device to update. Omit to update the local binary.
+        name: Option<String>,
+        /// Update every registered device (cannot be combined with a device name).
+        #[arg(long, conflicts_with = "name")]
+        all: bool,
+        /// Specific release tag (default: latest).
+        #[arg(long)]
+        version: Option<String>,
+    },
+
+    /// Pan/tilt/zoom control via the device's VISCA HTTP endpoint (port 8091).
+    /// Same path the clawcam-app web UI uses; requires the on-device VISCA
+    /// server (set CLAWCAM_PTZ_SERIAL in the systemd unit) connected to a
+    /// real conference-cam motor over RS-232/RS-485.
+    Ptz {
+        /// Device name from registry
+        name: String,
+        /// Port for the on-device VISCA HTTP server (default 8091)
+        #[arg(long, default_value = "8091")]
+        port: u16,
+        #[command(subcommand)]
+        action: PtzCliAction,
+    },
+
     /// On-device: capture a JPEG snapshot (used internally by remote snap)
     #[command(name = "_snap", hide = true)]
     SnapLocal {
@@ -125,6 +151,30 @@ pub enum Command {
         /// Log file path
         #[arg(long)]
         log_path: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+pub enum PtzCliAction {
+    /// Return the camera to its home/center position.
+    Center,
+    /// Stop all motion immediately.
+    Stop,
+    /// Send a direction burst. Each axis is -1 (left/down/wide), 0 (no motion),
+    /// or +1 (right/up/tele). The camera auto-stops after --duration ms.
+    Nudge {
+        /// Pan direction: -1 (left), 0, +1 (right)
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        pan: i32,
+        /// Tilt direction: -1 (down), 0, +1 (up)
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        tilt: i32,
+        /// Zoom direction: -1 (wide), 0, +1 (tele)
+        #[arg(long, default_value = "0", allow_hyphen_values = true)]
+        zoom: i32,
+        /// Duration of the burst in milliseconds before auto-stop (default 300)
+        #[arg(long, default_value = "300")]
+        duration: u64,
     },
 }
 
@@ -189,6 +239,34 @@ pub async fn run(cli: Cli) -> Result<()> {
             let registry = DeviceRegistry::load()?;
             let dev = registry.get(&name)?;
             crate::ssh::teardown::run_teardown(&dev).await
+        }
+        Command::Update { name, all, version } => {
+            if all {
+                crate::update::update_all(version.as_deref()).await
+            } else if let Some(n) = name {
+                let registry = DeviceRegistry::load()?;
+                let dev = registry.get(&n)?;
+                crate::update::update_remote(&dev, version.as_deref()).await
+            } else {
+                crate::update::update_local(version.as_deref()).await
+            }
+        }
+        Command::Ptz { name, port, action } => {
+            let registry = DeviceRegistry::load()?;
+            let dev = registry.get(&name)?;
+            let action = match action {
+                PtzCliAction::Center => crate::media::ptz::PtzAction::Center,
+                PtzCliAction::Stop => crate::media::ptz::PtzAction::Stop,
+                PtzCliAction::Nudge { pan, tilt, zoom, duration } => {
+                    crate::media::ptz::PtzAction::Nudge {
+                        pan,
+                        tilt,
+                        zoom,
+                        duration_ms: duration,
+                    }
+                }
+            };
+            crate::media::ptz::run_ptz(&dev, port, action).await
         }
         Command::SnapLocal { out } => {
             crate::media::snap::run_snap_local(&out)
