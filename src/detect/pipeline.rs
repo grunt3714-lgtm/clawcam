@@ -57,8 +57,34 @@ pub fn create_pipeline(
     } else {
         None
     };
+    // Prefer the Pi's VideoCore hardware MJPEG decoder (`v4l2jpegdec`) when
+    // available. USB MJPEG cams produce compressed frames that the ARM has to
+    // decompress — at 720p30 software `jpegdec` burns 70%+ of a core. Moving
+    // the decode onto `bcm2835-codec` drops CPU dramatically.
+    //
+    // Caveat: `v4l2jpegdec` outputs DMABuf video, and the GStreamer build on
+    // Raspberry Pi OS Trixie has `videoflip` that refuses DMABuf-derived
+    // buffers (negotiation silently stalls). We skip HW decode when the
+    // pipeline also needs videoflip; when rotation is identity we can drop
+    // videoflip entirely and get the HW win. Set CLAWCAM_HW_DECODE=0 to
+    // force SW if a particular cam negotiates poorly.
+    let flip_method = rotate_method(std::env::var("CLAWCAM_ROTATE").ok().as_deref());
+    let needs_videoflip = flip_method != "identity";
+    let prefer_hw_decode = needs_jpeg_decode
+        && !needs_videoflip
+        && std::env::var("CLAWCAM_HW_DECODE").ok().as_deref() != Some("0");
     let jpegdec = if needs_jpeg_decode {
-        Some(gst::ElementFactory::make("jpegdec").build()?)
+        let (elem, kind) = if prefer_hw_decode {
+            match gst::ElementFactory::make("v4l2jpegdec").build() {
+                Ok(e) => (e, "v4l2jpegdec (hw)"),
+                Err(_) => (gst::ElementFactory::make("jpegdec").build()?, "jpegdec (sw)"),
+            }
+        } else {
+            let reason = if needs_videoflip { " (videoflip active — HW decode blocked)" } else { "" };
+            (gst::ElementFactory::make("jpegdec").build()?, Box::leak(format!("jpegdec (sw){reason}").into_boxed_str()) as &'static str)
+        };
+        tracing::info!("MJPEG decoder: {kind}");
+        Some(elem)
     } else {
         None
     };
@@ -68,13 +94,19 @@ pub fn create_pipeline(
         None
     };
 
-    // Only videoconvert+videoscale if libcamera can't deliver our target caps
-    // directly. For libcamerasrc + NV12 @ a supported sensor size, we can go
-    // straight into capsfilter → flip → tee and keep everything in NV12 DMABufs.
-    let flip_method = rotate_method(std::env::var("CLAWCAM_ROTATE").ok().as_deref());
-    let flip = gst::ElementFactory::make("videoflip")
-        .property_from_str("video-direction", flip_method)
-        .build()?;
+    // `videoflip` is only added to the pipeline when rotation is actually
+    // requested. When it's identity, skipping the element both saves a small
+    // amount of CPU (the no-op copy is still ~5-10% of a core at 720p30) and
+    // lets us use HW MJPEG decode upstream (see jpegdec block above).
+    let flip = if needs_videoflip {
+        Some(
+            gst::ElementFactory::make("videoflip")
+                .property_from_str("video-direction", flip_method)
+                .build()?,
+        )
+    } else {
+        None
+    };
     // IMPORTANT: format=NV12 + interlace-mode=progressive are required for
     // v4l2h264enc on Pi (bcm2835-codec) to negotiate correctly.
     let caps = gst::ElementFactory::make("capsfilter")
@@ -143,19 +175,37 @@ pub fn create_pipeline(
         .build();
 
     pipeline.add_many([
-        &source, &caps, &flip, &tee,
+        &source, &caps, &tee,
         &jpeg_queue, &jpegenc, jpeg_sink.upcast_ref(),
         &rgb_queue, &rgb_scale, &rgb_convert, &rgb_caps, rgb_sink.upcast_ref(),
     ])?;
+    if let Some(f) = &flip {
+        pipeline.add(f)?;
+    }
     if let (Some(c), Some(d), Some(v)) = (&src_caps, &jpegdec, &src_convert) {
         pipeline.add_many([c, d, v])?;
     }
 
-    if let (Some(c), Some(d), Some(v)) = (&src_caps, &jpegdec, &src_convert) {
-        gst::Element::link_many([&source, c, d, v, &caps, &flip, &tee])?;
-    } else {
-        gst::Element::link_many([&source, &caps, &flip, &tee])?;
-    }
+    // Assemble the pre-tee segment. Order matters here because GStreamer will
+    // reject a link if upstream caps don't fit downstream. The final sink of
+    // this segment is always `tee`; everything else depends on the cam type
+    // and whether rotation is needed.
+    let pre_tee: Vec<&gst::Element> = {
+        let mut v: Vec<&gst::Element> = Vec::new();
+        v.push(&source);
+        if let (Some(c), Some(d), Some(conv)) = (&src_caps, &jpegdec, &src_convert) {
+            v.push(c);
+            v.push(d);
+            v.push(conv);
+        }
+        v.push(&caps);
+        if let Some(f) = &flip {
+            v.push(f);
+        }
+        v.push(&tee);
+        v
+    };
+    gst::Element::link_many(pre_tee.as_slice())?;
 
     gst::Element::link_many([&jpeg_queue, &jpegenc, jpeg_sink.upcast_ref()])?;
     tee.link_pads(None, &jpeg_queue, None)?;
