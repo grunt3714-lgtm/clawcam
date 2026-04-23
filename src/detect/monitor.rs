@@ -9,6 +9,7 @@ use tracing::{info, warn};
 
 use crate::detect::event::{EventDecision, EventManager, UpdateReason};
 use crate::detect::frame_buffer::{FrameBuffer, TimestampedFrame};
+use crate::detect::orientation::OrientationWatch;
 use crate::detect::pipeline;
 use crate::detect::ptz_track::PtzTracker;
 use crate::detect::tracker::ObjectTracker;
@@ -103,6 +104,14 @@ pub async fn run_monitor(
 
     // Optional PTZ auto-tracker (UVC). Disabled unless CLAWCAM_PTZ_TRACK=1.
     let mut ptz_tracker = PtzTracker::from_env();
+
+    // Orientation watchdog — fires a one-shot webhook per track when the bbox
+    // aspect indicates the person isn't upright for `CLAWCAM_UPRIGHT_CONFIRM_MS`.
+    // Opt-in via `CLAWCAM_UPRIGHT_CHECK=1`.
+    let mut orientation_watch = OrientationWatch::from_env();
+    if orientation_watch.enabled() {
+        info!("orientation watchdog enabled");
+    }
 
     let stream_url_owned = std::env::var("CLAWCAM_STREAM_URL")
         .ok()
@@ -266,6 +275,36 @@ pub async fn run_monitor(
         // Steer the camera to keep the most persistent subject centered.
         if let Some(pt) = ptz_tracker.as_mut() {
             pt.update(&tracks, frame.width, frame.height);
+        }
+
+        // Orientation watchdog: one-shot alert per track when the person's
+        // bbox aspect indicates they're not upright (fallen / lying down /
+        // sideways relative to expected mount). Evaluates every cycle but
+        // debounces internally — only returns track IDs crossing the threshold.
+        for track_id in orientation_watch.evaluate(&tracks) {
+            let track = tracks.iter().find(|t| t.track_id == track_id);
+            let bbox_str = track
+                .map(|t| format!("{}x{}", t.bbox.right - t.bbox.left, t.bbox.bottom - t.bbox.top))
+                .unwrap_or_default();
+            info!("orientation alert: track#{track_id} not upright (bbox {bbox_str})");
+            let eid = event_id
+                .clone()
+                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+            fire_webhook(
+                webhook_url,
+                webhook_token,
+                &hostname,
+                &detections,
+                &jpeg,
+                "ai_orientation_unusual",
+                "update",
+                &eid,
+                track.into_iter().cloned().collect::<Vec<_>>().as_slice(),
+                None,
+                None,
+                None,
+                None,
+            );
         }
 
         // Push telemetry (every inference cycle) so the web UI can draw live overlays.
