@@ -32,6 +32,15 @@ pub async fn run_setup(
     let cam_source = detect_camera_source(dev).await?;
     info!("detected camera source: {cam_source}");
 
+    // 2b. For USB webcams: disable kernel USB autosuspend on UVC devices.
+    // Cheap UVC chipsets (e.g. Sonix/Microdia 0c45:6366) deadlock after autosuspend —
+    // v4l2 stops delivering frames and the only recovery is closing/reopening the fd.
+    // clawcam's monitor doesn't reopen the fd, so the pipeline stalls indefinitely.
+    if cam_source == "v4l2src" {
+        info!("installing udev rule to disable USB autosuspend on UVC cameras...");
+        install_uvc_autosuspend_fix(dev).await?;
+    }
+
     // 3. Deploy clawcam binary
     info!("deploying clawcam binary...");
     let arch = session::run_cmd(dev, "uname -m").await?;
@@ -146,6 +155,44 @@ WantedBy=multi-user.target
     } else {
         anyhow::bail!("service failed to start — check `journalctl -u {SERVICE_NAME}` on {}", dev.host);
     }
+
+    Ok(())
+}
+
+/// Install a udev rule that disables USB autosuspend for any UVC camera, and
+/// apply it immediately to currently-connected UVC devices so a reboot isn't
+/// required.
+async fn install_uvc_autosuspend_fix(dev: &Device) -> Result<()> {
+    let rule = "# Installed by clawcam setup: disable USB autosuspend on UVC cameras.\n\
+                # Autosuspend on cheap UVC chipsets (e.g. Sonix/Microdia 0c45:6366) leaves the\n\
+                # device in a state where v4l2 stops delivering frames until the fd is closed\n\
+                # and reopened. clawcam's monitor never reopens the fd, so the pipeline stalls.\n\
+                ACTION==\"add\", SUBSYSTEM==\"usb\", DRIVERS==\"uvcvideo\", TEST==\"power/control\", ATTR{power/control}=\"on\"\n";
+
+    let tmp_local = "/tmp/99-clawcam-no-usb-autosuspend.rules";
+    std::fs::write(tmp_local, rule)?;
+    session::scp_to(dev, tmp_local, "/tmp/99-clawcam-no-usb-autosuspend.rules").await?;
+    std::fs::remove_file(tmp_local).ok();
+
+    session::run_cmd(dev,
+        "sudo mv /tmp/99-clawcam-no-usb-autosuspend.rules /etc/udev/rules.d/99-clawcam-no-usb-autosuspend.rules && \
+         sudo chown root:root /etc/udev/rules.d/99-clawcam-no-usb-autosuspend.rules && \
+         sudo udevadm control --reload-rules && \
+         sudo udevadm trigger --action=change --subsystem-match=usb || true"
+    ).await.context("failed to install udev rule")?;
+
+    // Apply to currently-connected UVC devices without waiting for a re-plug or reboot.
+    // Walk USB interface dirs, find ones with bInterfaceClass=0e (video), set power/control=on
+    // on the parent device.
+    session::run_cmd(dev,
+        "for ifc in /sys/bus/usb/devices/*:*; do \
+            cls=$(cat \"$ifc/bInterfaceClass\" 2>/dev/null || echo); \
+            if [ \"$cls\" = \"0e\" ]; then \
+                dev_dir=\"${ifc%:*}\"; \
+                echo on | sudo tee \"$dev_dir/power/control\" >/dev/null 2>&1 || true; \
+            fi; \
+         done"
+    ).await.ok();
 
     Ok(())
 }
