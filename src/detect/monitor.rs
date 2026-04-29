@@ -165,6 +165,51 @@ pub async fn run_monitor(
         });
     }
 
+    // Pipeline supervisor — watches the GStreamer bus for ERROR/EOS and triggers
+    // shutdown so the main loop's end-phase cleanup runs and systemd respawns us.
+    // Why: rtspclientsink does not auto-reconnect when MediaMTX restarts; the
+    // sink errors out and the pipeline goes silent while detection keeps running,
+    // making clawcam look healthy from the outside while no frames reach MediaMTX.
+    {
+        let bus = gst_pipeline
+            .bus()
+            .context("pipeline bus unavailable")?;
+        let shutdown = shutdown.clone();
+        std::thread::spawn(move || {
+            loop {
+                if shutdown.load(Ordering::SeqCst) {
+                    break;
+                }
+                let Some(msg) =
+                    bus.timed_pop(gstreamer::ClockTime::from_mseconds(500))
+                else {
+                    continue;
+                };
+                match msg.view() {
+                    gstreamer::MessageView::Error(e) => {
+                        let src = e
+                            .src()
+                            .map(|o| o.name().to_string())
+                            .unwrap_or_else(|| "?".to_string());
+                        warn!(
+                            "pipeline bus ERROR from {src}: {} (debug: {:?}) — triggering shutdown for respawn",
+                            e.error(),
+                            e.debug()
+                        );
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    gstreamer::MessageView::Eos(_) => {
+                        warn!("pipeline bus EOS — triggering shutdown for respawn");
+                        shutdown.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+    }
+
     let telemetry_url = std::env::var("CLAWCAM_TELEMETRY_URL").ok();
     let telemetry_token = webhook_token_owned.clone();
 
