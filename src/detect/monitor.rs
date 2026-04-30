@@ -227,6 +227,16 @@ pub async fn run_monitor(
     let mut infer_count: u32 = 0;
     const INFER_LOG_EVERY: u32 = 40;
 
+    // Stall watchdog: count consecutive 5-s receive timeouts. If frames stop
+    // arriving for STALL_EXIT_TICKS in a row (12 × 5 s = 60 s), bail with an
+    // error so systemd's Restart=always recycles us into a fresh pipeline.
+    // The 5-s `warn!` already alerts on transient stalls; this turns a
+    // *persistent* stall into a forced restart instead of an open-ended log
+    // spam (the symptom we kept hitting on pond-cam, where the pipeline was
+    // silently dead for 12+ h while the process kept "running").
+    const STALL_EXIT_TICKS: u32 = 12;
+    let mut stall_ticks: u32 = 0;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -237,9 +247,22 @@ pub async fn run_monitor(
         // would make the tracker overshoot (acting on where the subject was,
         // not where it is). Always inference on what's current.
         let mut frame = match frame_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(f) => f,
+            Ok(f) => {
+                stall_ticks = 0;
+                f
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                warn!("no frame received in 5s, pipeline may be stalled");
+                stall_ticks = stall_ticks.saturating_add(1);
+                warn!(
+                    "no frame received in 5s ({}/{}), pipeline may be stalled",
+                    stall_ticks, STALL_EXIT_TICKS
+                );
+                if stall_ticks >= STALL_EXIT_TICKS {
+                    anyhow::bail!(
+                        "pipeline stalled for {}s with no frames; exiting so systemd restarts",
+                        stall_ticks * 5
+                    );
+                }
                 continue;
             }
             Err(_) => break,
